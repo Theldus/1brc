@@ -5,10 +5,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-/* Current version: v1. */
+/* Current version: v2. */
 
 /***********************************************************************
  * Change log:
@@ -18,23 +19,29 @@
  *   hashing, awfully slow (slower than the reference Java), but it
  *   works.
  *
- *
+ * v2:
+ *  Add simple hashtable support: open addressing for collisions + SDBM
+ *  for the string hash. Its ~8x faster than v1, finally we are (twice)
+ *  faster than the reference Java code.
  */
+
+#define HT_SIZE (10000 * 5)
 
 static int    txt_fd;
 static char  *txt_buff;
 static off_t  txt_size;
 
-static struct station
+struct station
 {
 	char *name;
 	float min;
 	float avg;
 	float max;
 	int count;
-} stations[10000] = {0};
+};
 
-static size_t total_stations = 0;
+static struct station stations[HT_SIZE] = {0};
+static size_t hashtable_entries = 0;
 
 /*
  * Open the given file and memory map it.
@@ -68,8 +75,151 @@ static void close_file(void)
 }
 
 /**
- * @brief Given the station line and its size, add it into the
- * memory.
+ * @brief For a given key and its size, returns an unsigned
+ * hash value of a 64-bit.
+ *
+ * @param key  String key.
+ * @param size String key length.
+ *
+ * @return Returns the hashed value.
+ */
+static uint64_t
+hashtable_sdbm(const void *key, size_t size)
+{
+	unsigned char *str;  /* String pointer.    */
+	uint64_t hash;       /* Resulting hash.    */
+	int c;               /* Current character. */
+
+	str  = (unsigned char *)key;
+	hash = 0;
+
+	for (size_t i = 0; i < size; i++) {
+		c    = *str++;
+		hash = c + (hash << 6) + (hash << 16) - hash;
+	}
+
+	return (hash);
+}
+
+/**
+ * @brief For a given string key and its length, returns
+ * the hashtable bucket index.
+ *
+ * @param key  String key.
+ * @param size String key length.
+ *
+ * @return Return hashtable index.
+ */
+static inline size_t
+hashtable_bucket_index(const void *key, size_t size)
+{
+	uint64_t hash;
+	size_t  index;
+	hash  = hashtable_sdbm(key, size);
+	index = (hash % HT_SIZE);
+	return (index);
+}
+
+/**
+ * @brief Given a station name and its name size, check if it
+ * exists in the hashtable.
+ *
+ * @param st_name Station name.
+ * @param st_size Station size.
+ * @param index   Returned index (if found).
+ *
+ * @return Returns the hashtable entry if found, NULL otherwise.
+ */
+static struct station *
+hashtable_find_station(const char *st_name, size_t st_size, size_t *index)
+{
+	size_t idx = hashtable_bucket_index(st_name, st_size);
+	size_t i,j;
+
+	if (stations[idx].name) {
+		if (!strncmp(st_name, stations[idx].name, st_size)) {
+			*index = idx;
+			return (&stations[idx]);
+		}
+		else
+			idx++;
+	}
+
+	/* Do open addressing to try to find the entry. */
+	idx %= HT_SIZE;
+	*index = idx;
+
+	for (i = 0, j = idx; i < HT_SIZE; i++, j = (j+1)%HT_SIZE) {
+		if (stations[j].name) {
+			if (!strncmp(st_name, stations[j].name, st_size)) {
+				*index = j;
+				return (&stations[j]);
+			}
+		}
+	}
+	return (NULL);
+}
+
+/**
+ * @brief Given a station name @p st_name of given size @p st_size
+ * and @p value, adds it into the hashtable.
+ */
+static void
+hashtable_add_station(const char *st_name, size_t st_size, float value)
+{
+	struct station *st;
+	size_t index;
+	size_t i,j;
+
+	i = j = 0;
+
+	/* Try to find first. */
+	st = hashtable_find_station(st_name, st_size, &index);
+	if (st)
+		goto found;
+
+	/* Not found... I'm lazy, so open addressing. */
+	for (size_t i = 0, j = index; i < HT_SIZE; i++, j=(j+1)%HT_SIZE) {
+		if (!stations[j].name) {
+			index = j;
+			goto add_entry;
+		}
+	}
+
+	/* If not found, hashtable full, we have a problem!. */
+	if (hashtable_entries == HT_SIZE)
+		err(1, "Hashtable full!, too many collisions!\n");
+
+	/* Not found. */
+add_entry:
+	hashtable_entries++;
+	if (j != 0 && j != index)
+		fprintf(stderr, "Open addressing, idx: %zu, j: %zu!!\n", index, j);
+
+	stations[index].avg   = value;
+	stations[index].min   = value;
+	stations[index].max   = value;
+	stations[index].count = 1;
+
+	stations[index].name = malloc(st_size + 1);
+	memcpy(stations[index].name, st_name, st_size);
+	stations[index].name[st_size] = '\0';
+	return;
+
+found:
+	/* Update entries. */
+	if (value < stations[index].min)
+		stations[index].min = value;
+	if (value > stations[index].max)
+		stations[index].max = value;
+
+	stations[index].avg += value;
+	stations[index].count++;
+}
+
+/**
+ * @brief Given the station line and its size, adds it into the
+ * hashtable.
  * @param station_line Line containing the station and temperature.
  * @param size Line size.
  */
@@ -87,48 +237,22 @@ static void add_station(const char *station_line, size_t size)
 	value   = strtof(delim+1, &endptr);
 	st_size = delim - station_line;
 
-	/* Iterate over the station array and check if there is
-	 * an existing match, if so, change the values, otherwise,
-	 * add a new entry.
-	 */
-	for (int i = 0; i < 10000; i++)
-	{
-		/* Empty entry, not found, add it. */
-		if (!stations[i].name)
-		{
-			total_stations++;
-			stations[i].avg   = value;
-			stations[i].min   = value;
-			stations[i].max   = value;
-			stations[i].count = 1;
-
-			stations[i].name = malloc(st_size + 1);
-			memcpy(stations[i].name, station_line, st_size);
-			stations[i].name[st_size] = '\0';
-			break;
-		}
-
-		else if (!strncmp(station_line, stations[i].name, st_size)) {
-			if (value < stations[i].min)
-				stations[i].min = value;
-			if (value > stations[i].max)
-				stations[i].max = value;
-
-			stations[i].avg += value;
-			stations[i].count++;
-			break;
-		}
-	}
+	hashtable_add_station(station_line, st_size, value);
 }
 
 /* String comparator. */
 static int
-cmpstringp(const void *p1, const void *p2)
+cmp_string(const void *p1, const void *p2)
 {
 	const struct station *s1, *s2;
 	s1 = p1;
 	s2 = p2;
-	return (strcmp(s1->name, s2->name));
+
+	if (!s1->name && !s2->name) return (0);
+	if (!s1->name) return (1);
+	if (!s2->name) return (-1);
+	else
+		return (strcmp(s1->name, s2->name));
 }
 
 /*
@@ -138,16 +262,18 @@ cmpstringp(const void *p1, const void *p2)
 static void list_stations(void)
 {
 	printf("{");
-	for (size_t i = 0; i < total_stations; i++)
+	for (size_t i = 0; i < hashtable_entries; i++)
 	{
+		if (!stations[i].name)
+			continue;
+
 		printf("%s=%.1f/%.1f/%.1f",
 			stations[i].name,
 			stations[i].min,
 			stations[i].avg / (float)stations[i].count,
-			stations[i].max,
-			stations[i].count);
+			stations[i].max);
 
-		if (i < total_stations - 1)
+		if (i < hashtable_entries - 1)
 			printf(", ");
 	}
 	printf("}\n");
@@ -178,8 +304,8 @@ int main(int argc, char **argv)
 	open_file(argv[1]);
 	do_read();
 
-	qsort(stations, total_stations,
-		sizeof(struct station), &cmpstringp);
+	qsort(stations, HT_SIZE,
+		sizeof(struct station), &cmp_string);
 
 	list_stations();
 	close_file();
