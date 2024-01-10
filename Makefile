@@ -1,5 +1,6 @@
 CC      ?= cc
 CFLAGS  += -O3 -march=native -mtune=native -g
+LDLIBS  += -pthread
 
 .PHONY: all clean
 
