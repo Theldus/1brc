@@ -10,7 +10,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-/* Current version: v7. */
+/* Current version: v8. */
 
 /***********************************************************************
  * Change log:
@@ -57,6 +57,15 @@
  * v7:
  *  Remove redundant memchr() and avoid back&forth parsing the temperature,
  *  which lead us to a 9% of speedup.
+ *
+ * v8:
+ *  This version removes all the ifs/else on the read_temperature()
+ *  by introducing lookup tables for parsing the numbers. Each index
+ *  in the table decides which number to read next, or which number
+ *  to multiply to, and etc.
+ *
+ *  The main idea is to avoid at most code branches, which causes branches
+ *  miss prediction and etc. This version bring us ~14% of speedup.
  *
  */
 
@@ -236,6 +245,20 @@ found:
 	stations[tid][index].count++;
 }
 
+/*
+ * Lookup table macro for the read_temperature() routine:
+ * the idea is that the char itself 'branches' the code
+ * and avoids if/else, makes the code linear and brings
+ * a decent speedup.
+ */
+#define lookup_char(type,name,first_char,vfirst_char,vsecond_char) \
+	static type name[256] = {\
+		[first_char]  = vfirst_char,\
+		['0'] = vsecond_char, ['1'] = vsecond_char, ['2'] = vsecond_char,\
+		['3'] = vsecond_char, ['4'] = vsecond_char, ['5'] = vsecond_char,\
+		['6'] = vsecond_char, ['7'] = vsecond_char, ['8'] = vsecond_char,\
+		['9'] = vsecond_char}
+
 /**
  * @brief Given the current line, reads the temperature
  * as an integer and return it.
@@ -250,32 +273,27 @@ read_temperature(const char *line, const char **ptr)
 {
 	const char *p = line;
 	int temp = 0;
-	int sign = 1;
 
-	if (*p == '-') {
-		sign = -1;
-		p++;
-	}
+	lookup_char(int8_t,  sign,      '-', -1, 1);
+	lookup_char(uint8_t, first_inc, '-',  1, 0);
+	lookup_char(uint8_t, m1,        '.', 10, 100);
+	lookup_char(uint8_t, nn1,       '.',  2, 1);
+	lookup_char(uint8_t, m2,        '.',  1, 10);
+	lookup_char(uint8_t, nn2,       '.',  0, 3);
+	lookup_char(uint8_t, m3,        '.',  0, 1);
+	lookup_char(uint8_t, incr,      '.',  3, 4);
 
-	/* Numbers of format:
-	 *    012345
-	 *    X.Y
-	 *    XY.Z
-	 */
-	if (p[1] == '.') {
-		temp = ((p[0] - '0') * 10) + (p[2] - '0');
-		p += 3;
-	}
+	p += first_inc[p[0]];
 
-	/* Numbers of format: XY.Z */
-	else {
-		temp = ((p[0] - '0') * 100) +
-			((p[1] - '0') * 10) + (p[3] - '0');
-		p += 4;
-	}
+	temp =
+		(p[0]-'0')*m1[p[1]] +
+		(p[nn1[p[1]]]-'0')*m2[p[1]] +
+		(p[nn2[p[1]]]-'0')*m3[p[1]];
+
+	p += incr[p[1]];
 
 	*ptr  = p;
-	temp *= sign;
+	temp *= sign[line[0]];
 	return (temp);
 }
 
