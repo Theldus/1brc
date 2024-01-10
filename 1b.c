@@ -10,7 +10,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-/* Current version: v6. */
+/* Current version: v7. */
 
 /***********************************************************************
  * Change log:
@@ -53,6 +53,11 @@
  *   - The merge process is quite quick and do not need to be optimized.
  *   - Loop unroll on read_temperature() function which make us 8% faster.
  *  Result: ~3.57x *faster* than v4 (on a quad-core CPU).
+ *
+ * v7:
+ *  Remove redundant memchr() and avoid back&forth parsing the temperature,
+ *  which lead us to a 9% of speedup.
+ *
  */
 
 #define NUM_THREADS 4
@@ -241,7 +246,7 @@ found:
  * by 10.
  */
 static inline int
-read_temperature(const char *line)
+read_temperature(const char *line, const char **ptr)
 {
 	const char *p = line;
 	int temp = 0;
@@ -252,15 +257,24 @@ read_temperature(const char *line)
 		p++;
 	}
 
-	/* Numbers of format: X.Y */
-	if (p[1] == '.')
+	/* Numbers of format:
+	 *    012345
+	 *    X.Y
+	 *    XY.Z
+	 */
+	if (p[1] == '.') {
 		temp = ((p[0] - '0') * 10) + (p[2] - '0');
+		p += 3;
+	}
 
 	/* Numbers of format: XY.Z */
-	else
+	else {
 		temp = ((p[0] - '0') * 100) +
 			((p[1] - '0') * 10) + (p[3] - '0');
+		p += 4;
+	}
 
+	*ptr  = p;
 	temp *= sign;
 	return (temp);
 }
@@ -272,22 +286,18 @@ read_temperature(const char *line)
  * @param station_line Line containing the station and temperature.
  * @param size         Line size.
  * @param tid          Thread index.
+ *
+ * @return Returns the pointer advanced for the next reading.
  */
-static void
+static inline const char*
 add_station(const char *station_line, size_t size, int tid)
 {
-	const char *delim, *st_name;
-	size_t st_size;
+	const char *delim;
 	int value;
 
-	delim = memchr(station_line, ';', size);
-	if (!delim)
-		err(1, "Invalid station?");
-
-	value   = read_temperature(delim+1);
-	st_size = delim - station_line;
-
-	hashtable_add_station(station_line, st_size, value, tid);
+	value = read_temperature(station_line+size+1, &delim);
+	hashtable_add_station(station_line, size, value, tid);
+	return (delim);
 }
 
 /* String comparator. */
@@ -389,9 +399,9 @@ do_thread_read(void *p)
 	prev  = td->base_buffer;
 	rsize = td->size;
 
-	while ((next = memchr(prev, '\n', rsize)) != NULL)
+	while ((next = memchr(prev, ';', rsize)) != NULL)
 	{
-		add_station(prev, next - prev, td->tidx);
+		next   = add_station(prev, next - prev, td->tidx);
 		rsize -= (next - prev + 1);
 		prev   = (next + 1);
 	}
