@@ -10,7 +10,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-/* Current version: v5. */
+/* Current version: v6. */
 
 /***********************************************************************
  * Change log:
@@ -45,6 +45,14 @@
  *  threads and protected by a mutex... which adds a huge bottleneck.
  *  Idiot? Yes, but I would like to see how bad it would be.
  *  Result: ~6.17x slower than v4.
+ *
+ * v6:
+ *  Nicely working threads implementation:
+ *   - Each thread now have its individual hashtable that is merged later
+ *     (to avoid locks & race conditions).
+ *   - The merge process is quite quick and do not need to be optimized.
+ *   - Loop unroll on read_temperature() function which make us 8% faster.
+ *  Result: ~3.57x *faster* than v4 (on a quad-core CPU).
  */
 
 #define NUM_THREADS 4
@@ -73,10 +81,8 @@ static struct thread_data {
 } tdata[NUM_THREADS];
 
 static pthread_t threads[NUM_THREADS];
-static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static struct station stations[HT_SIZE] = {0};
-static size_t hashtable_entries = 0;
+static struct station stations[NUM_THREADS][HT_SIZE] = {0};
+static size_t hashtable_entries[NUM_THREADS] = {0};
 
 /*
  * Open the given file and memory map it.
@@ -162,18 +168,18 @@ hashtable_bucket_index(const void *key, size_t size)
  * @param st_name Station name.
  * @param st_size Station size.
  * @param index   Returned index (if found).
+ * @param tid     Thread index.
  *
  * @return Returns the hashtable entry if found, NULL otherwise.
  */
 static inline struct station *
-hashtable_find_station(const char *st_name, size_t st_size, size_t *index)
+hashtable_find_station(const char *st_name, size_t st_size, size_t *index, int tid)
 {
 	size_t idx = hashtable_bucket_index(st_name, st_size);
-	size_t i,j;
 
 	*index = idx;
-	if (stations[idx].name)
-		return (&stations[idx]);
+	if (stations[tid][idx].name)
+		return (&stations[tid][idx]);
 
 	return (NULL);
 }
@@ -185,47 +191,44 @@ hashtable_find_station(const char *st_name, size_t st_size, size_t *index)
  * @param st_name Station name.
  * @param st_size Station name length.
  * @param value   Temperature value.
+ * @param tid     Thread index.
  */
 static void
-hashtable_add_station(const char *st_name, size_t st_size, int value)
+hashtable_add_station(const char *st_name, size_t st_size, int value, int tid)
 {
 	struct station *st;
 	size_t index;
 
 	/* Try to find first. */
-pthread_mutex_lock(&mutex);
-	st = hashtable_find_station(st_name, st_size, &index);
+	st = hashtable_find_station(st_name, st_size, &index, tid);
 	if (likely(st != NULL))
 		goto found;
 
 	/* If not found, hashtable full, we have a problem!. */
-	if (hashtable_entries == HT_SIZE)
+	if (hashtable_entries[tid] == HT_SIZE)
 		err(1, "Hashtable full!, too many collisions!\n");
 
-	/* Not found. */
-add_entry:
-	hashtable_entries++;
-	stations[index].avg   = value;
-	stations[index].min   = value;
-	stations[index].max   = value;
-	stations[index].count = 1;
+	/* Not found, add entry. */
+	hashtable_entries[tid]++;
+	stations[tid][index].avg   = value;
+	stations[tid][index].min   = value;
+	stations[tid][index].max   = value;
+	stations[tid][index].count = 1;
 
-	stations[index].name = malloc(st_size + 1);
-	memcpy(stations[index].name, st_name, st_size);
-	stations[index].name[st_size] = '\0';
-pthread_mutex_unlock(&mutex);
+	stations[tid][index].name = malloc(st_size + 1);
+	memcpy(stations[tid][index].name, st_name, st_size);
+	stations[tid][index].name[st_size] = '\0';
 	return;
 
 found:
 	/* Update entries. */
-	if (value < stations[index].min)
-		stations[index].min = value;
-	if (value > stations[index].max)
-		stations[index].max = value;
+	if (value < stations[tid][index].min)
+		stations[tid][index].min = value;
+	if (value > stations[tid][index].max)
+		stations[tid][index].max = value;
 
-	stations[index].avg += value;
-	stations[index].count++;
-pthread_mutex_unlock(&mutex);
+	stations[tid][index].avg += value;
+	stations[tid][index].count++;
 }
 
 /**
@@ -249,15 +252,14 @@ read_temperature(const char *line)
 		p++;
 	}
 
-	while (likely(*p != '\n')) {
-		if (*p == '.') {
-			p++;
-			continue;
-		}
-		temp *= 10;
-		temp += (*p - '0');
-		p++;
-	}
+	/* Numbers of format: X.Y */
+	if (p[1] == '.')
+		temp = ((p[0] - '0') * 10) + (p[2] - '0');
+
+	/* Numbers of format: XY.Z */
+	else
+		temp = ((p[0] - '0') * 100) +
+			((p[1] - '0') * 10) + (p[3] - '0');
 
 	temp *= sign;
 	return (temp);
@@ -266,14 +268,16 @@ read_temperature(const char *line)
 /**
  * @brief Given the station line and its size, adds it into the
  * hashtable.
+ *
  * @param station_line Line containing the station and temperature.
- * @param size Line size.
+ * @param size         Line size.
+ * @param tid          Thread index.
  */
-static void add_station(const char *station_line, size_t size)
+static void
+add_station(const char *station_line, size_t size, int tid)
 {
 	const char *delim, *st_name;
 	size_t st_size;
-	char *endptr;
 	int value;
 
 	delim = memchr(station_line, ';', size);
@@ -283,7 +287,7 @@ static void add_station(const char *station_line, size_t size)
 	value   = read_temperature(delim+1);
 	st_size = delim - station_line;
 
-	hashtable_add_station(station_line, st_size, value);
+	hashtable_add_station(station_line, st_size, value, tid);
 }
 
 /* String comparator. */
@@ -308,21 +312,64 @@ cmp_string(const void *p1, const void *p2)
 static void list_stations(void)
 {
 	printf("{");
-	for (size_t i = 0; i < hashtable_entries; i++)
+	for (size_t i = 0; i < HT_SIZE; i++)
 	{
-		if (!stations[i].name)
-			continue;
+		/* The first null entry means that we have walked
+		 * through everything (because the list is)
+		 * already sorted.
+		 */
+		if (!stations[0][i].name)
+			break;
 
 		printf("%s=%.1f/%.1f/%.1f",
-			stations[i].name,
-			(float)stations[i].min/10.0f,
-			((float)stations[i].avg / (float)stations[i].count)/10.0f,
-			(float)stations[i].max/10.0f);
+			stations[0][i].name,
+			 (float)stations[0][i].min/10.0f,
+			((float)stations[0][i].avg / (float)stations[0][i].count)/10.0f,
+			 (float)stations[0][i].max/10.0f);
 
-		if (i < hashtable_entries - 1)
+		if (i < HT_SIZE - 1 && stations[0][i + 1].name)
 			printf(", ");
 	}
 	printf("}\n");
+}
+
+/**
+ * @brief Iterates over each per-thread hashtable and merges
+ * them into a single-hashtable.
+ */
+static void do_merge_threads_data(void)
+{
+	struct station *st;
+	int i, tid;
+
+	/* Copy all the data into the thread 0 hashtable. */
+	for (i = 0; i < HT_SIZE; i++) {
+		st = &stations[0][i];
+
+		for (tid = 1; tid < NUM_THREADS; tid++) {
+			/* Skip empty entries. */
+			if (!stations[tid][i].name)
+				continue;
+
+			/* Copy the name it the entry is empty. */
+			if (!st->name) {
+				st->name = stations[tid][i].name;
+				st->min  = stations[tid][i].min;
+				st->max  = stations[tid][i].max;
+			} else {
+				/* If not empty, accumulate min & max values. */
+				if (stations[tid][i].min < st->min)
+					st->min = stations[tid][i].min;
+				if (stations[tid][i].max > st->max)
+					st->max = stations[tid][i].max;
+			}
+
+			/* Copy the remaining data, accumulating where
+			 * needed. */
+			st->avg   += stations[tid][i].avg;
+			st->count += stations[tid][i].count;
+		}
+	}
 }
 
 /**
@@ -344,7 +391,7 @@ do_thread_read(void *p)
 
 	while ((next = memchr(prev, '\n', rsize)) != NULL)
 	{
-		add_station(prev, next - prev);
+		add_station(prev, next - prev, td->tidx);
 		rsize -= (next - prev + 1);
 		prev   = (next + 1);
 	}
@@ -411,8 +458,9 @@ int main(int argc, char **argv)
 
 	open_file(argv[1]);
 	do_read();
+	do_merge_threads_data();
 
-	qsort(stations, HT_SIZE,
+	qsort(&stations[0], HT_SIZE,
 		sizeof(struct station), &cmp_string);
 
 	list_stations();
