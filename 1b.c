@@ -9,7 +9,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-/* Current version: v2. */
+/* Current version: v3. */
 
 /***********************************************************************
  * Change log:
@@ -23,6 +23,11 @@
  *  Add simple hashtable support: open addressing for collisions + SDBM
  *  for the string hash. Its ~8x faster than v1, finally we are (twice)
  *  faster than the reference Java code.
+ *
+ * v3:
+ *  Removal of strtof() for reading the temperature values, handling
+ *  temperatures as integers and parsing them manually. Its ~3x faster
+ *  than v2.
  */
 
 #define HT_SIZE (10000 * 5)
@@ -34,9 +39,9 @@ static off_t  txt_size;
 struct station
 {
 	char *name;
-	float min;
-	float avg;
-	float max;
+	int min;
+	int avg;
+	int max;
 	int count;
 };
 
@@ -163,9 +168,13 @@ hashtable_find_station(const char *st_name, size_t st_size, size_t *index)
 /**
  * @brief Given a station name @p st_name of given size @p st_size
  * and @p value, adds it into the hashtable.
+ *
+ * @param st_name Station name.
+ * @param st_size Station name length.
+ * @param value   Temperature value.
  */
 static void
-hashtable_add_station(const char *st_name, size_t st_size, float value)
+hashtable_add_station(const char *st_name, size_t st_size, int value)
 {
 	struct station *st;
 	size_t index;
@@ -218,6 +227,41 @@ found:
 }
 
 /**
+ * @brief Given the current line, reads the temperature
+ * as an integer and return it.
+ *
+ * @param line Line containing the temperature (as float).
+ *
+ * @return Returns the read temperature as integer, multiplied
+ * by 10.
+ */
+static inline int
+read_temperature(const char *line)
+{
+	const char *p = line;
+	int temp = 0;
+	int sign = 1;
+
+	if (*p == '-') {
+		sign = -1;
+		p++;
+	}
+
+	while (*p != '\n') {
+		if (*p == '.') {
+			p++;
+			continue;
+		}
+		temp *= 10;
+		temp += (*p - '0');
+		p++;
+	}
+
+	temp *= sign;
+	return (temp);
+}
+
+/**
  * @brief Given the station line and its size, adds it into the
  * hashtable.
  * @param station_line Line containing the station and temperature.
@@ -228,13 +272,13 @@ static void add_station(const char *station_line, size_t size)
 	const char *delim, *st_name;
 	size_t st_size;
 	char *endptr;
-	float value;
+	int value;
 
 	delim = memchr(station_line, ';', size);
 	if (!delim)
 		err(1, "Invalid station?");
 
-	value   = strtof(delim+1, &endptr);
+	value   = read_temperature(delim+1);
 	st_size = delim - station_line;
 
 	hashtable_add_station(station_line, st_size, value);
@@ -269,9 +313,9 @@ static void list_stations(void)
 
 		printf("%s=%.1f/%.1f/%.1f",
 			stations[i].name,
-			stations[i].min,
-			stations[i].avg / (float)stations[i].count,
-			stations[i].max);
+			(float)stations[i].min/10.0f,
+			((float)stations[i].avg / (float)stations[i].count)/10.0f,
+			(float)stations[i].max/10.0f);
 
 		if (i < hashtable_entries - 1)
 			printf(", ");
