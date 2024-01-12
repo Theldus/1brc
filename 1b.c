@@ -6,11 +6,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <immintrin.h>
 #include <inttypes.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-/* Current version: v8. */
+/* Current version: v9. */
 
 /***********************************************************************
  * Change log:
@@ -67,7 +68,27 @@
  *  The main idea is to avoid at most code branches, which causes branches
  *  miss prediction and etc. This version bring us ~14% of speedup.
  *
+ * v9:
+ *  This version implements a memchr()-like function called mchar(),
+ *  specialized in finding semicolons as quickly as possible.
+ *
+ *  Similar to the glibc's memchr(), mchar() also utilizes AVX2 but in
+ *  an intelligent manner: mchar() doesn't lose its context and the data
+ *  obtained is retained between function calls.
+ *
+ *  The main issue with memchr() is that, although it is fast, as soon
+ *  as it returns, the function is obligated to discard the data obtained
+ *  up to that point, such as the last read address and the count and
+ *  positions of semicolons found. To address this, mchar() includes a
+ *  context structure that caches the already obtained data between
+ *  executions, avoiding the repeated reading of memory and always
+ *  reading linearly from start to finish.
+ *
+ *  This has resulted in a speedup of ~10%.
+ *
  */
+
+#define USE_AVX2 1
 
 #define NUM_THREADS 4
 #define HT_SIZE (10000 * 5)
@@ -400,6 +421,100 @@ static void do_merge_threads_data(void)
 	}
 }
 
+struct mchar_ctx {
+	uint32_t cmask;
+	char *cptr;
+	char *prev_ptr;
+};
+
+/**
+ * @brief Finds the first occurrence of ';' in the pointer pointed
+ * by @ptr.
+ *
+ * @param ptr       Buffer to be searched.
+ * @param rem_bytes Buffer size
+ * @param ctx       Function context
+ *
+ * @return Returns a pointer to the found ';', or NULL if
+ * not found.
+ *
+ * @note The function context should not be touched after its
+ * initialization, but must be initialized as follows:
+ *   ctx->cmask = 0
+ *   ctx->cptr  = initial_base_ptr
+ *   ctx->prev_ptr (not needed to change)
+ */
+static inline char*
+mchar(const char *ptr, size_t rem_bytes, struct mchar_ctx *ctx)
+{
+	int set_semic;
+	static char mask_vec[32] = {
+		';',';',';',';',';',';',';',';', ';',';',';',';',';',';',';',';',
+		';',';',';',';',';',';',';',';', ';',';',';',';',';',';',';',';',
+	};
+
+	__m256i mask_semic;
+	const char *s  = ptr;
+	const char *e  = s+rem_bytes;
+
+	/* Check if there is a 'cache-hit' on cmask. */
+	if (ctx->cmask)
+	{
+		set_semic     = __builtin_ffs(ctx->cmask);
+		ctx->cmask  >>= set_semic;
+
+		/* Since the provided pointer ptr might  advance in
+		 * regard to the position saved in cmask, we need to
+		 * use our prev_ptr to calculate that distance and fix
+		 * the new expected position.
+		 */
+		ctx->prev_ptr = (char*)(s + set_semic) - (s - ctx->prev_ptr);
+		return (ctx->prev_ptr);
+	}
+
+	/* If our cache is empty but we have checked for ';' past the
+	 * informed ptr, we ignore the ptr and starts to read from
+	 * the last checked byte. That way, we completely avoid
+	 * reading the same memory region twice =).
+	 */
+	else if (ctx->cptr > s)
+		s = ctx->cptr;
+
+	/* Check if there is some semicolon around. */
+	mask_semic = _mm256_loadu_si256((const __m256i*)mask_vec);
+	while (s+31 < e)
+	{
+		__m256i memory       = _mm256_loadu_si256((const __m256i*)s);
+		__m256i cmp_semic_ff = _mm256_cmpeq_epi8(memory, mask_semic);
+		ctx->cmask = _mm256_movemask_epi8(cmp_semic_ff);
+
+		if (ctx->cmask)
+		{
+			set_semic = __builtin_ffs(ctx->cmask);
+
+			/* Erase the current '1' to the next read. */
+			ctx->cmask >>= set_semic;
+
+			/* Our cache pointer points to last byte that we have checked
+			 * until now, so we don't read memory twice. */
+			ctx->cptr     = (char*)s + 32;
+			ctx->prev_ptr = (char*)(s + set_semic - 1);
+			return (ctx->prev_ptr);
+		}
+
+		s += 32;
+	}
+
+	/* If not found, check sequentially. */
+	while (s < e) {
+		if (*s == ';')
+			return (char*)(s);
+		s++;
+	}
+
+	return (NULL);
+}
+
 /**
  * @brief Worker thread, works basically the same way as the
  * single-threaded version.
@@ -410,14 +525,20 @@ static void*
 do_thread_read(void *p)
 {
 	struct thread_data *td = p;
+	struct mchar_ctx ctx = {0};
 	const char  *prev;
 	const char  *next;
 	size_t rsize;
 
-	prev  = td->base_buffer;
-	rsize = td->size;
+	prev     = td->base_buffer;
+	rsize    = td->size;
+	ctx.cptr = (char*)prev;
 
+#if USE_AVX2 == 1
+	while ((next = mchar(prev, rsize, &ctx)) != NULL)
+#else
 	while ((next = memchr(prev, ';', rsize)) != NULL)
+#endif
 	{
 		next   = add_station(prev, next - prev, td->tidx);
 		rsize -= (next - prev + 1);
