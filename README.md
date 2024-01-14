@@ -51,6 +51,7 @@ The results:
 |                v7                |          ~2.855s         |         35.13x         |  [ffdf7d0] | Remove redundant memchr() |
 |                v8                |          ~2.51s          |         39.96x         |  [718e9b3] |  Branchless temp parsing  |
 |                v9                |          ~2.26s          |         44.38x         |  [db8d462] |  AVX2 routine to find ';' |
+|                v10               |          ~2.17s          |         46.22x         |  [fa1debb] |  Remove MAP_POPULATE flag |
 
 [1brc (The One Billion Row Challenge)]: https://github.com/gunnarmorling/1brc
 [official 1brc repository]: https://github.com/gunnarmorling/1brc
@@ -68,6 +69,7 @@ The results:
 [ffdf7d0]: https://github.com/Theldus/1brc/commit/ffdf7d09eac0d51ac95a382365aca4ed1c25f065
 [718e9b3]: https://github.com/Theldus/1brc/commit/718e9b314a918a3a4d1ee19fca93223890dbd13c
 [db8d462]: https://github.com/Theldus/1brc/commit/db8d462179fb5a6f7bb402916673c3eb6f680473
+[fa1debb]: https://github.com/Theldus/1brc/commit/fa1debb5abc7ada841021399a231e18555f0f623
 
 ## ChangeLog
 
@@ -306,6 +308,9 @@ And what does this change? Everything! Unlike `memchr()`, `mchar()` has a contex
 With these two features, `mchar()` _guarantees_ that it will not search the same memory segment repeatedly, and multiple results found are cached and returned in future invocations without additional memory reads.
 
 It is important to note that `mchar()` works well with the 'cache' concept only for memory blocks that have no changes between function invocations; this is a prerequisite. For memory blocks that may have changes, the function should not assume anything about the already-read memory portion, and there is no better alternative than the traditional `memchr()`.
+
+### v10
+Ironically, removing the `MAP_POPULATE` flag from `mmap()` slightly improved performance by 4%... I can't say exactly why, if anyone has any ideas...
 
 ## Final Thoughts
 I enjoyed the challenge _a lot_ and had a lot of fun in the process. It is always interesting to see how optimization opportunities can hide in seemingly harmless places and how much they cost in the final code.
