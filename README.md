@@ -307,3 +307,9 @@ With these two features, `mchar()` _guarantees_ that it will not search the same
 
 It is important to note that `mchar()` works well with the 'cache' concept only for memory blocks that have no changes between function invocations; this is a prerequisite. For memory blocks that may have changes, the function should not assume anything about the already-read memory portion, and there is no better alternative than the traditional `memchr()`.
 
+## Final Thoughts
+I enjoyed the challenge _a lot_ and had a lot of fun in the process. It is always interesting to see how optimization opportunities can hide in seemingly harmless places and how much they cost in the final code.
+
+Some may say that challenges like this have no use for real-world code, but I strongly disagree. Challenges like this make us think outside the box and that reflects directly on any code in the future. I’m not talking about premature optimizations, but about having a critical sense of the code that is written.
+
+Moreover, I learned a lot during the process, which is why I created this repository and tried to document all the changes I made. Anyway, I highly recommend it =).
