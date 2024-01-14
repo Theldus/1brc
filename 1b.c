@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 
-/* Current version: v9. */
+/* Current version: v10. */
 
 /***********************************************************************
  * Change log:
@@ -86,6 +86,11 @@
  *
  *  This has resulted in a speedup of ~10%.
  *
+ * v10:
+ *  Remove 'MAP_POPULATE' flag from mmap.
+ *  For some reason this flag increases a little bit of the execution
+ *  time. Speedup of ~4%.
+ *
  */
 
 #define USE_AVX2 1
@@ -135,7 +140,7 @@ static void open_file(const char *file)
 	txt_size = st.st_size;
 
 	txt_buff = mmap(NULL, st.st_size, PROT_READ,
-		MAP_PRIVATE|MAP_POPULATE, txt_fd, 0);
+		MAP_PRIVATE, txt_fd, 0);
 
 	if (txt_buff == MAP_FAILED)
 		err(1, "Unable to mmap!\n");
