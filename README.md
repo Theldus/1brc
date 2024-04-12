@@ -35,7 +35,7 @@ Originally proposed in Java, the challenge has attracted interest for developmen
 ## My results
 All the tests were performed on an i5 7300HQ with 8GB of RAM, running Slackware 14.2-current (15-ish), with GCC 9.3 and OpenJDK 21.0.1. It’s important to note that due to memory constraints (the 1B rows file is 12GB!), the following results were obtained with an input of 400M rows (5.3GB), but these should scale proportionally for larger inputs.
 
-There are 10 attempts/code versions, which you can check in the commit history (also tagged from `v1` to `v10` for easier checkout).
+There are 11 attempts/code versions, which you can check in the commit history (also tagged from `v1` to `v11` for easier checkout).
 
 The results:
 |            **Version**           | **Time (s) - 400M rows** | **Speedup (baseline)** | **Commit** |      **Small notes**      |
@@ -52,6 +52,7 @@ The results:
 |                v8                |          ~2.51s          |         39.96x         |  [718e9b3] |  Branchless temp parsing  |
 |                v9                |          ~2.26s          |         44.38x         |  [db8d462] |  AVX2 routine to find ';' |
 |                v10               |          ~2.17s          |         46.22x         |  [fa1debb] |  Remove MAP_POPULATE flag |
+|                v11               |          ~1.54s          |         65.12x         |  [3b9466f] |  New hash function        |
 
 [1brc (The One Billion Row Challenge)]: https://github.com/gunnarmorling/1brc
 [official 1brc repository]: https://github.com/gunnarmorling/1brc
@@ -70,6 +71,7 @@ The results:
 [718e9b3]: https://github.com/Theldus/1brc/commit/718e9b314a918a3a4d1ee19fca93223890dbd13c
 [db8d462]: https://github.com/Theldus/1brc/commit/db8d462179fb5a6f7bb402916673c3eb6f680473
 [fa1debb]: https://github.com/Theldus/1brc/commit/fa1debb5abc7ada841021399a231e18555f0f623
+[3b9466f]: https://github.com/Theldus/1brc/commit/3b9466f519eef5e204997964179ba0ead142c362
 
 ## ChangeLog
 
@@ -334,6 +336,43 @@ Edit:
 There is some discussion about it on issue [v10 MAP_POPULATE speed up possibile explanation], you might want to take a look.
 
 [v10 MAP_POPULATE speed up possibile explanation]: https://github.com/Theldus/1brc/issues/1
+
+---
+
+### v11
+These days I was watching the amazing video: ["Faster than Rust and C++: the PERFECT hash table"], and among the many interesting insights, one caught my attention: "know your data" and "there are no purely random data". The Achilles' heel of every hash table is being generic, but if you know your data beforehand...
+
+Since `v4`, my code no longer handles collisions, and therefore, it only works for a fixed set of station names. Considering this, what harm would it do to rethink the hash function and try to create one that is lightweight and specifically tailored to our dataset?
+
+Based on the ideas from the video, I came up with the following code below:
+```c
+static inline uint64_t
+sugoi_hash(const char *l, size_t len)
+{
+    uint64_t hash = 0;
+    if (likely(len >= 5)) {
+        hash |= ((uint64_t)l[0] & 0x1F) << 40;
+        hash |= ((uint64_t)l[1] & 0x1F) << 32;
+        hash |= ((uint64_t)l[2] & 0x1F) << 24;
+        hash |= ((uint64_t)l[3] & 0x1F) << 16;
+        hash |= ((uint64_t)l[len-2] & 0x1F) << 8;
+        hash |= ((uint64_t)l[len-1] & 0x1F) << 0;
+    } else {
+        hash |= ((uint64_t)l[0] & 0x1F) << 24;
+        hash |= ((uint64_t)l[1] & 0x1F) << 16;
+        hash |= ((uint64_t)l[len-2] & 0x1F) << 8;
+        hash |= ((uint64_t)l[len-1] & 0x1F) << 0;
+    }
+    return (hash);
+}
+```
+
+The code is quite simple: according to the length of the key, it takes the first and last characters of each station name and assembles a 64-bit value from that.
+The `& 0x1F` gets the character position in the ascii table... this isn't really necessary, but for some reason it helped remove the collisions.
+
+This simple code brought a speedup of 40%!!!: I imagine that the code running in (almost) constant time and without loops helped the CPU a lot.
+
+["Faster than Rust and C++: the PERFECT hash table"]: https://www.youtube.com/watch?v=DMQ_HcNSOAI&ab_channel=strager
 
 ## Final Thoughts
 I enjoyed the challenge _a lot_ and had a lot of fun in the process. It is always interesting to see how optimization opportunities can hide in seemingly harmless places and how much they cost in the final code.
