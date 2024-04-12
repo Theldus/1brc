@@ -35,7 +35,7 @@ Originally proposed in Java, the challenge has attracted interest for developmen
 ## My results
 All the tests were performed on an i5 7300HQ with 8GB of RAM, running Slackware 14.2-current (15-ish), with GCC 9.3 and OpenJDK 21.0.1. It’s important to note that due to memory constraints (the 1B rows file is 12GB!), the following results were obtained with an input of 400M rows (5.3GB), but these should scale proportionally for larger inputs.
 
-There are 9 attempts/code versions, which you can check in the commit history (also tagged from `v1` to `v9` for easier checkout).
+There are 10 attempts/code versions, which you can check in the commit history (also tagged from `v1` to `v10` for easier checkout).
 
 The results:
 |            **Version**           | **Time (s) - 400M rows** | **Speedup (baseline)** | **Commit** |      **Small notes**      |
@@ -78,19 +78,29 @@ Below is an explanation of each version created for the challenge and the though
 ### v1
 This is the initial and simplest version of all. I just wanted to create a quick-and-dirty solution to the problem, with no optimizations and without even using hash tables. I believe it's a good starting point for my own baseline and also as a curiosity about what would be the 'worst' possible implementation for the problem, even losing to the Java baseline.
 
+---
+
 ### v2
 Adds a fairly simple implementation of a hash table with open addressing (using SDBM as the hash function) and is finally ~8x faster than v1 and twice as fast as the Java baseline. The real challenge truly begins from here.
+
+---
 
 ### v3
 Removes the use of the `strtof()` function and manually parses temperatures as integers. This is easily possible given the challenge's conditions, where numbers have only one fractional digit. Surprisingly, v3 brought a 3x speedup over v2. Apparently, `strtof()` adds *a lot* of overhead to the code.
 
+---
+
 ### v4
 Some minor changes such as inline functions and `likely()/unlikely()`, but the most significant change was in the hash table: since it proved to have no collisions, I completely removed the open addressing and string comparisons, which added significant overhead to execution. Some may consider this 'cheating' since there might be collisions for different inputs, and I don't blame them, but the following versions will continue with this applied change. These changes gave us a 1.32x speedup over v3.
+
+---
 
 ### v5
 Initial (and intentionally poor) version of threads. I am not taking on this challenge to compete with anyone or racing against time, so I also like to explore intentionally bad solutions (like v1) to see how bad things can get.
 
 In this version, the hash table is shared among all threads and protected by a mutex, adding a huge performance penalty. Specifically, this version is ~6.17x slower than v4.
+
+---
 
 ### v6
 Correctly implemented threads! In this version, each thread has its own individual hash table, eliminating race conditions between threads and the need for locks. After all threads finish, the results are merged into a single hash table and then sorted by the station's name. The merging and sorting process is done in a single thread since it is fast and gains little benefit from multi-threading.
@@ -99,8 +109,12 @@ In addition to fixing the thread implementation, this version also unrolls the l
 
 Overall, this version is ~3.57x faster than the previous version on a quad-core CPU.
 
+---
+
 ### v7
 Removes an unnecessary `memchr()` used to find '\n' in parsing temperatures. The temperature parsing itself becomes predictable about where the newline character will be, so the function call can be safely removed. This brought us a 9% speedup over the previous code.
+
+---
 
 ### v8
 This version removes _all_ if statements in the `read_temperature()` function and replaces them with entirely branchless code, bringing a speedup of **~14%** over the previous version. Since this modification might not be immediately obvious (and I really **liked** it), I believe it deserves a more detailed explanation.
@@ -215,6 +229,8 @@ Thus, the tables serve to, according to the character at `p[1]`, decide which is
 
 Note that in `temp = ...`, there is an additional third multiplication, and the reason for it is quite simple: if `p[1] == '.'`, the third addition should not occur. In this case, multiplication is by 0 and invalidates the sum; otherwise, it multiplies by 1, and the sum is performed. Clever, isn't it?
 
+---
+
 ### v9
 This version introduces the `mchar()` function for an extremely optimized search for `';'`, implemented in SIMD/AVX2, replacing the traditional `memchr()`. But before proceeding, let me address the first probable question:
 > Q: 'GNU libc's `memchr()` is heavily optimized and also uses SIMD, why reinvent the wheel?'
@@ -309,8 +325,15 @@ With these two features, `mchar()` _guarantees_ that it will not search the same
 
 It is important to note that `mchar()` works well with the 'cache' concept only for memory blocks that have no changes between function invocations; this is a prerequisite. For memory blocks that may have changes, the function should not assume anything about the already-read memory portion, and there is no better alternative than the traditional `memchr()`.
 
+---
+
 ### v10
 Ironically, removing the `MAP_POPULATE` flag from `mmap()` slightly improved performance by 4%... I can't say exactly why, if anyone has any ideas...
+
+Edit:
+There is some discussion about it on issue [v10 MAP_POPULATE speed up possibile explanation], you might want to take a look.
+
+[v10 MAP_POPULATE speed up possibile explanation]: https://github.com/Theldus/1brc/issues/1
 
 ## Final Thoughts
 I enjoyed the challenge _a lot_ and had a lot of fun in the process. It is always interesting to see how optimization opportunities can hide in seemingly harmless places and how much they cost in the final code.
